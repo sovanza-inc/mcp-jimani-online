@@ -42,13 +42,24 @@ const getFetch = async () => {
 };
 
 // ========== AUTH STATE ==========
+// mode: "basic" | "bearer" | "apikey"
+const DEFAULT_MODE = (process.env.JIMANI_AUTH_MODE || "").toLowerCase() ||
+  (DEFAULT_STATIC_KEY ? "apikey" : (DEFAULT_CLIENT_ID && DEFAULT_PARTNER_ID ? "basic" : null));
+
 let authState = {
+  mode: DEFAULT_MODE,
   bearer: null,
   bearerExpiry: 0,
   staticKey: DEFAULT_STATIC_KEY || null,
   clientId: DEFAULT_CLIENT_ID || null,
   partnerId: DEFAULT_PARTNER_ID || null,
 };
+
+function basicHeader() {
+  if (!authState.clientId || !authState.partnerId) throw new Error("Basic auth requires clientId + partnerId");
+  const raw = authState.clientId + ":" + authState.partnerId;
+  return "Basic " + Buffer.from(raw, "utf-8").toString("base64");
+}
 
 async function obtainBearer() {
   if (!authState.clientId || !authState.partnerId) {
@@ -87,18 +98,23 @@ async function ensureBearer() {
 async function apiCall(method, path, body = null, opts = {}) {
   const fetch = await getFetch();
   const headers = { "Content-Type": "application/json", "Accept": "application/json" };
+  const mode = opts.auth || authState.mode;
 
-  if (opts.auth === "apikey" || (!opts.auth && authState.staticKey && !authState.bearer && !authState.clientId)) {
-    if (!authState.staticKey) throw new Error("No API key configured");
+  if (mode === "apikey") {
+    if (!authState.staticKey) throw new Error("apikey mode requires JIMANI_API_KEY");
     headers["X-Api-Key"] = authState.staticKey;
-  } else if (opts.auth === "bearer" || (!opts.auth && (authState.bearer || authState.clientId))) {
+  } else if (mode === "basic") {
+    headers["Authorization"] = basicHeader();
+  } else if (mode === "bearer") {
     const token = await ensureBearer();
-    headers["Authorization"] = `Bearer ${token}`;
+    headers["Authorization"] = "Bearer " + token;
+  } else {
+    throw new Error("No auth configured. Call authenticate or set JIMANI_AUTH_MODE.");
   }
 
   const init = { method, headers };
   if (body && method !== "GET" && method !== "HEAD") init.body = JSON.stringify(body);
-  const res = await fetch(`${API_BASE}${path}`, init);
+  const res = await fetch(API_BASE + path, init);
   const text = await res.text();
   let data;
   try { data = JSON.parse(text); } catch { data = text; }
@@ -114,23 +130,44 @@ function buildMcpServer() {
   // ----- AUTH -----
   server.tool(
     "authenticate",
-    "Obtain a Bearer token from Jimani /api/Token (Client Credentials). Subsequent calls auto-use the cached token.",
+    "Configure Jimani authentication. Modes: basic (Authorization: Basic base64(clientId:partnerId)), bearer (OAuth Client Credentials via /api/Token), apikey (X-Api-Key header). Mode is auto-inferred from supplied params if omitted.",
     {
-      clientId: z.string().optional().describe("Jimani OAuth Client ID (overrides env)"),
-      partnerId: z.string().optional().describe("Jimani OAuth Partner ID (overrides env)"),
-      apiKey: z.string().optional().describe("Static X-Api-Key (alternative to OAuth)"),
+      mode: z.enum(["basic", "bearer", "apikey"]).optional().describe("Auth mode"),
+      clientId: z.string().optional().describe("Jimani Client ID"),
+      partnerId: z.string().optional().describe("Jimani Partner ID"),
+      apiKey: z.string().optional().describe("Static X-Api-Key value"),
     },
-    async ({ clientId, partnerId, apiKey }) => {
-      if (apiKey) {
-        authState.staticKey = apiKey;
-        authState.bearer = null;
-        authState.bearerExpiry = 0;
-        return { content: [{ type: "text", text: "Static API key set. Subsequent calls will use X-Api-Key." }] };
-      }
+    async ({ mode, clientId, partnerId, apiKey }) => {
+      if (apiKey) authState.staticKey = apiKey;
       if (clientId) authState.clientId = clientId;
       if (partnerId) authState.partnerId = partnerId;
-      const r = await obtainBearer();
-      return { content: [{ type: "text", text: `Bearer token acquired. Expires in ${r.expiresIn}s.` }] };
+
+      let resolved = mode;
+      if (!resolved) {
+        if (apiKey) resolved = "apikey";
+        else if (clientId && partnerId) resolved = "basic";
+        else if (authState.staticKey) resolved = "apikey";
+        else if (authState.clientId && authState.partnerId) resolved = "basic";
+      }
+      if (!resolved) {
+        return { content: [{ type: "text", text: "No credentials supplied. Pass apiKey, or clientId+partnerId, or set env vars." }] };
+      }
+      authState.mode = resolved;
+
+      if (resolved === "apikey") {
+        authState.bearer = null;
+        authState.bearerExpiry = 0;
+        return { content: [{ type: "text", text: "Mode: apikey. Using X-Api-Key header." }] };
+      }
+      if (resolved === "basic") {
+        authState.bearer = null;
+        authState.bearerExpiry = 0;
+        return { content: [{ type: "text", text: "Mode: basic. Authorization: Basic <base64(clientId:partnerId)> will be sent on every call." }] };
+      }
+      if (resolved === "bearer") {
+        const r = await obtainBearer();
+        return { content: [{ type: "text", text: "Mode: bearer. Token acquired, expires in " + r.expiresIn + "s." }] };
+      }
     }
   );
 
@@ -141,6 +178,7 @@ function buildMcpServer() {
         type: "text",
         text: JSON.stringify({
           apiBase: API_BASE,
+          mode: authState.mode || "unset",
           hasBearer: Boolean(authState.bearer),
           bearerExpiresInSeconds: authState.bearerExpiry > now ? Math.floor((authState.bearerExpiry - now) / 1000) : 0,
           clientIdConfigured: Boolean(authState.clientId),
