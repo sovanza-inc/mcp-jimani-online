@@ -259,10 +259,13 @@ function buildMcpServer() {
 
   server.tool(
     "reservation_availability",
-    "GET /api/Reservation/GetHorecaReservationAvailability — Check availability for a reservation type.",
-    { reservationTypeId: z.string().describe("Reservation type ID") },
-    async ({ reservationTypeId }) => {
-      const r = await apiCall("GET", `/api/Reservation/GetHorecaReservationAvailability?reservationTypeId=${encodeURIComponent(reservationTypeId)}`);
+    "GET /api/Reservation/GetHorecaReservationAvailability — Returns per-arrangement open hours + open dates for a reservation type. WARNING: response may exceed 90k chars (returns years of open dates).",
+    {
+      reservationTypeId: z.string().describe("Reservation type ID"),
+      idLanguage: z.number().optional().default(1).describe("Language ID (1=English, required by Jimani)"),
+    },
+    async ({ reservationTypeId, idLanguage }) => {
+      const r = await apiCall("GET", `/api/Reservation/GetHorecaReservationAvailability?reservationTypeId=${encodeURIComponent(reservationTypeId)}&IdLanguage=${idLanguage}`);
       return { content: jsonContent(r) };
     }
   );
@@ -274,30 +277,40 @@ function buildMcpServer() {
 
   server.tool(
     "reservation_fields",
-    "GET /api/Reservation/GetHorecaReservationFields — List custom fields for a reservation type.",
-    { reservationTypeId: z.string().describe("Reservation type ID") },
-    async ({ reservationTypeId }) => {
-      const r = await apiCall("GET", `/api/Reservation/GetHorecaReservationFields?reservationTypeId=${encodeURIComponent(reservationTypeId)}`);
+    "GET /api/Reservation/GetHorecaReservationFields — List required + optional custom fields for a reservation type. Includes field types (text/select/radio/textarea/label) and options.",
+    {
+      reservationTypeId: z.string().describe("Reservation type ID"),
+      idLanguage: z.number().optional().default(1).describe("Language ID (1=English, required by Jimani)"),
+    },
+    async ({ reservationTypeId, idLanguage }) => {
+      const r = await apiCall("GET", `/api/Reservation/GetHorecaReservationFields?reservationTypeId=${encodeURIComponent(reservationTypeId)}&IdLanguage=${idLanguage}`);
       return { content: jsonContent(r) };
     }
   );
 
   server.tool(
     "reservation_products",
-    "GET /api/Reservation/GetHorecaReservationProducts — List products available for a reservation type.",
-    { reservationTypeId: z.string().describe("Reservation type ID") },
-    async ({ reservationTypeId }) => {
-      const r = await apiCall("GET", `/api/Reservation/GetHorecaReservationProducts?reservationTypeId=${encodeURIComponent(reservationTypeId)}`);
+    "GET /api/Reservation/GetHorecaReservationProducts — List upsell/deposit products for a reservation type. Includes 5 price tiers per product.",
+    {
+      reservationTypeId: z.string().describe("Reservation type ID"),
+      idLanguage: z.number().optional().default(1).describe("Language ID (1=English, required by Jimani)"),
+    },
+    async ({ reservationTypeId, idLanguage }) => {
+      const r = await apiCall("GET", `/api/Reservation/GetHorecaReservationProducts?reservationTypeId=${encodeURIComponent(reservationTypeId)}&IdLanguage=${idLanguage}`);
       return { content: jsonContent(r) };
     }
   );
 
   server.tool(
     "reservation_guest_details",
-    "GET /api/Reservation/GetHorecaReservationGuestDetails — Look up guest details by email.",
-    { email: z.string().describe("Guest email address") },
-    async ({ email }) => {
-      const r = await apiCall("GET", `/api/Reservation/GetHorecaReservationGuestDetails?email=${encodeURIComponent(email)}`);
+    "GET /api/Reservation/GetHorecaReservationGuestDetails — Returns the SCHEMA of guest detail fields (salutation, firstname, lastname, email, phone) required on CreateReservation. Despite the name, does NOT look up an existing guest.",
+    {
+      email: z.string().optional().describe("Guest email (ignored by Jimani in current impl)"),
+      idLanguage: z.number().optional().default(1).describe("Language ID (1=English, required by Jimani)"),
+    },
+    async ({ email, idLanguage }) => {
+      const qs = `IdLanguage=${idLanguage}` + (email ? `&email=${encodeURIComponent(email)}` : "");
+      const r = await apiCall("GET", `/api/Reservation/GetHorecaReservationGuestDetails?${qs}`);
       return { content: jsonContent(r) };
     }
   );
