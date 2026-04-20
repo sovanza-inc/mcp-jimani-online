@@ -231,10 +231,44 @@ function buildMcpServer() {
     }
   );
 
-  server.tool("company_opening_hours", "GET /api/Company/GetHorecaOpeningHours — Retrieve HORECA opening hours.", {}, async () => {
-    const r = await apiCall("GET", "/api/Company/GetHorecaOpeningHours");
-    return { content: jsonContent(r) };
-  });
+  server.tool(
+    "company_opening_hours",
+    "GET /api/Company/GetHorecaOpeningHours — Retrieve HORECA opening hours. NOTE: Jimani returns thousands of day records in one call (~280k chars). This tool client-side filters to fromDate..toDate to keep responses usable.",
+    {
+      fromDate: z.string().optional().describe("ISO date YYYY-MM-DD — defaults to today"),
+      toDate: z.string().optional().describe("ISO date YYYY-MM-DD — defaults to fromDate + 30 days"),
+    },
+    async ({ fromDate, toDate }) => {
+      const r = await apiCall("GET", "/api/Company/GetHorecaOpeningHours");
+      if (!r.ok || !r.data || !Array.isArray(r.data.result)) {
+        return { content: jsonContent(r) };
+      }
+      const from = fromDate ? new Date(fromDate) : new Date();
+      from.setHours(0, 0, 0, 0);
+      const to = toDate ? new Date(toDate) : new Date(from.getTime() + 30 * 86400000);
+      to.setHours(23, 59, 59, 999);
+      const filtered = r.data.result.filter((row) => {
+        if (!row.openingDate) return false;
+        const d = new Date(row.openingDate);
+        return d >= from && d <= to;
+      });
+      return {
+        content: jsonContent({
+          ...r,
+          data: {
+            ...r.data,
+            result: filtered,
+            _meta: {
+              totalRecords: r.data.result.length,
+              returned: filtered.length,
+              window: { from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10) },
+              note: "Filtered client-side. Pass fromDate/toDate to change window.",
+            },
+          },
+        }),
+      };
+    }
+  );
 
   server.tool(
     "company_update_opening_hours",
@@ -259,14 +293,42 @@ function buildMcpServer() {
 
   server.tool(
     "reservation_availability",
-    "GET /api/Reservation/GetHorecaReservationAvailability — Returns per-arrangement open hours + open dates for a reservation type. WARNING: response may exceed 90k chars (returns years of open dates).",
+    "GET /api/Reservation/GetHorecaReservationAvailability — Returns per-arrangement open hours + open dates for a reservation type. Client-side filters openDates to fromDate..toDate window to prevent 90k+ char responses.",
     {
       reservationTypeId: z.string().describe("Reservation type ID"),
       idLanguage: z.number().optional().default(1).describe("Language ID (1=English, required by Jimani)"),
+      fromDate: z.string().optional().describe("ISO date YYYY-MM-DD — defaults to today"),
+      toDate: z.string().optional().describe("ISO date YYYY-MM-DD — defaults to fromDate + 14 days"),
     },
-    async ({ reservationTypeId, idLanguage }) => {
+    async ({ reservationTypeId, idLanguage, fromDate, toDate }) => {
       const r = await apiCall("GET", `/api/Reservation/GetHorecaReservationAvailability?reservationTypeId=${encodeURIComponent(reservationTypeId)}&IdLanguage=${idLanguage}`);
-      return { content: jsonContent(r) };
+      if (!r.ok || !r.data || !Array.isArray(r.data.result)) {
+        return { content: jsonContent(r) };
+      }
+      const from = fromDate ? new Date(fromDate) : new Date();
+      from.setHours(0, 0, 0, 0);
+      const to = toDate ? new Date(toDate) : new Date(from.getTime() + 14 * 86400000);
+      to.setHours(23, 59, 59, 999);
+      const trimmed = r.data.result.map((arr) => {
+        const dates = (arr.openDates || []).filter((d) => {
+          const dt = new Date(d);
+          return dt >= from && dt <= to;
+        });
+        return { ...arr, openDates: dates, _totalOpenDates: (arr.openDates || []).length };
+      });
+      return {
+        content: jsonContent({
+          ...r,
+          data: {
+            ...r.data,
+            result: trimmed,
+            _meta: {
+              window: { from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10) },
+              note: "openDates filtered client-side. Pass fromDate/toDate to change window.",
+            },
+          },
+        }),
+      };
     }
   );
 
@@ -317,11 +379,133 @@ function buildMcpServer() {
 
   server.tool(
     "reservation_create",
-    "POST /api/Reservation/CreateReservation — Create a new reservation. Pass JSON body (CreateReservationWidgetCommand).",
-    { body: z.string().describe("JSON string of CreateReservationWidgetCommand") },
-    async ({ body }) => {
-      const r = await apiCall("POST", "/api/Reservation/CreateReservation", JSON.parse(body));
-      return { content: jsonContent(r) };
+    "POST /api/Reservation/CreateReservation — Create a new reservation. The 7 required fields (key, fields, baseUrl, language, arrivaltime, guestFields, CombinationInfo) are undocumented in Swagger — this tool supplies sensible defaults. Pass a raw body override if you know the exact shape Jimani expects.",
+    {
+      reservationTypeId: z.number().describe("Reservation type ID (from reservation_types)"),
+      date: z.string().describe("Reservation date YYYY-MM-DD"),
+      arrivaltime: z.string().describe("Arrival time HH:mm:ss (e.g. 19:00:00)"),
+      guestCount: z.number().describe("Number of guests"),
+      guest: z.object({
+        firstName: z.string(),
+        lastName: z.string(),
+        email: z.string(),
+        phone: z.string().optional(),
+        salutation: z.string().optional(),
+      }).describe("Primary guest contact"),
+      fields: z.array(z.object({
+        idField: z.number(),
+        value: z.string(),
+      })).optional().describe("Custom field answers (from reservation_fields). Default []"),
+      guestFields: z.array(z.object({
+        idGuestDetails: z.number(),
+        value: z.string(),
+      })).optional().describe("Guest field values (from reservation_guest_details schema). Default derived from guest object"),
+      language: z.string().optional().default("en").describe("Language code (en/nl/de/fr)"),
+      baseUrl: z.string().optional().default("https://jimaniai.sovanza.net").describe("Widget base URL for return redirects"),
+      key: z.string().optional().default("mcp-client").describe("Widget key / client identifier"),
+      combinationInfo: z.object({}).passthrough().optional().describe("Combination upsell info object. Default {}"),
+      rawBody: z.string().optional().describe("Pass a complete JSON body to bypass field assembly (advanced)"),
+    },
+    async (args) => {
+      if (args.rawBody) {
+        const r = await apiCall("POST", "/api/Reservation/CreateReservation", JSON.parse(args.rawBody));
+        return { content: jsonContent(r) };
+      }
+      // Auto-build guestFields from guest object if not supplied
+      // Default tags observed in guest_details schema: salutation, firstname, lastname, email, phone
+      const guestFields = args.guestFields || [
+        args.guest.salutation ? { idGuestDetails: 1542, value: args.guest.salutation } : null,
+        { idGuestDetails: 1543, value: args.guest.firstName },
+        { idGuestDetails: 1544, value: args.guest.lastName },
+        { idGuestDetails: 1545, value: args.guest.email },
+        args.guest.phone ? { idGuestDetails: 1546, value: args.guest.phone } : null,
+      ].filter(Boolean);
+
+      const body = {
+        key: args.key,
+        baseUrl: args.baseUrl,
+        language: args.language,
+        reservationTypeId: args.reservationTypeId,
+        date: args.date,
+        arrivaltime: args.arrivaltime,
+        guestCount: args.guestCount,
+        guest: args.guest,
+        fields: args.fields || [],
+        guestFields,
+        CombinationInfo: args.combinationInfo || {},
+      };
+      const r = await apiCall("POST", "/api/Reservation/CreateReservation", body);
+      return { content: jsonContent({ request: body, response: r }) };
+    }
+  );
+
+  // Workflow macro: discover → validate → create in one shot
+  server.tool(
+    "book_reservation",
+    "Macro: one-shot booking helper. Fetches reservation_types for locationId, validates the chosen type against guestCount and minimumTimeBeforeInterval, then creates the reservation. Returns step-by-step trace.",
+    {
+      locationId: z.string().describe("Location ID (e.g. '4080' for Restaurant)"),
+      reservationTypeId: z.number().describe("Reservation type ID (from reservation_types)"),
+      date: z.string().describe("Reservation date YYYY-MM-DD"),
+      arrivaltime: z.string().describe("Arrival time HH:mm:ss"),
+      guestCount: z.number(),
+      guest: z.object({
+        firstName: z.string(),
+        lastName: z.string(),
+        email: z.string(),
+        phone: z.string().optional(),
+      }),
+      language: z.string().optional().default("en"),
+    },
+    async (args) => {
+      const trace = [];
+      // Step 1: validate type against location
+      const typesRes = await apiCall("GET", `/api/Reservation/GetHorecaReservationTypes?locationId=${encodeURIComponent(args.locationId)}`);
+      trace.push({ step: "fetch_types", status: typesRes.status, count: Array.isArray(typesRes.data?.result) ? typesRes.data.result.length : 0 });
+      if (!typesRes.ok) return { content: jsonContent({ trace, error: "Failed to fetch types", details: typesRes }) };
+
+      const type = typesRes.data.result.find((t) => t.idReservationtype === args.reservationTypeId);
+      if (!type) return { content: jsonContent({ trace, error: `Reservation type ${args.reservationTypeId} not found in location ${args.locationId}` }) };
+      trace.push({ step: "validate_type", found: true, minGuests: type.minimumGuests, maxGuests: type.maximumGuests, duration: type.duration });
+
+      if (args.guestCount < type.minimumGuests || args.guestCount > type.maximumGuests) {
+        return { content: jsonContent({ trace, error: `Guest count ${args.guestCount} out of range [${type.minimumGuests}, ${type.maximumGuests}]` }) };
+      }
+
+      // Step 2: minimum lead time check
+      if (type.minimumTimeBeforeInterval > 0) {
+        const now = Date.now();
+        const target = new Date(`${args.date}T${args.arrivaltime}Z`).getTime();
+        const leadMs = target - now;
+        const requiredMs = type.minimumTimeBeforeInterval * 1000;
+        if (leadMs < requiredMs) {
+          return { content: jsonContent({ trace, error: `Lead time too short: ${Math.floor(leadMs/3600000)}h vs required ${Math.floor(requiredMs/3600000)}h` }) };
+        }
+        trace.push({ step: "lead_time_ok", leadHours: Math.floor(leadMs/3600000), requiredHours: Math.floor(requiredMs/3600000) });
+      }
+
+      // Step 3: create
+      const body = {
+        key: "mcp-book-reservation",
+        baseUrl: "https://jimaniai.sovanza.net",
+        language: args.language,
+        reservationTypeId: args.reservationTypeId,
+        date: args.date,
+        arrivaltime: args.arrivaltime,
+        guestCount: args.guestCount,
+        guest: args.guest,
+        fields: [],
+        guestFields: [
+          { idGuestDetails: 1543, value: args.guest.firstName },
+          { idGuestDetails: 1544, value: args.guest.lastName },
+          { idGuestDetails: 1545, value: args.guest.email },
+          ...(args.guest.phone ? [{ idGuestDetails: 1546, value: args.guest.phone }] : []),
+        ],
+        CombinationInfo: {},
+      };
+      const createRes = await apiCall("POST", "/api/Reservation/CreateReservation", body);
+      trace.push({ step: "create", status: createRes.status, ok: createRes.ok });
+      return { content: jsonContent({ trace, request: body, response: createRes }) };
     }
   );
 
