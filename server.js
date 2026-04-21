@@ -568,6 +568,98 @@ function buildMcpServer() {
     }
   );
 
+
+  // ═══════════════════════════════════════════════════════════════
+  // PROVIDER-AGNOSTIC BOOKING TOOLS
+  // Dispatches to jimani / zenchef / opentable / thefork / resy / sevenrooms
+  // ═══════════════════════════════════════════════════════════════
+  const { getAdapter: _getAdapter, SUPPORTED: _SUPPORTED } = require('./adapters');
+
+  function _buildAdapter(provider) {
+    if (provider === 'jimani' || !provider) {
+      const basic = (authState.clientId && authState.partnerId)
+        ? 'Basic ' + Buffer.from(authState.clientId + ':' + authState.partnerId, 'utf-8').toString('base64')
+        : null;
+      return _getAdapter('jimani', {
+        apiBase: API_BASE,
+        basicHeader: basic,
+        apiKey: authState.staticKey || null,
+        bearerToken: authState.bearer || null,
+      });
+    }
+    return _getAdapter(provider, {});
+  }
+
+  const _providerEnum = z.enum(['jimani','zenchef','opentable','thefork','resy','sevenrooms']);
+
+  server.tool('booking_providers', 'List which reservation providers this MCP supports.', {}, async () => ({
+    content: jsonContent({ supported: _SUPPORTED, live: ['jimani'], stubs: _SUPPORTED.filter(p => p !== 'jimani') })
+  }));
+
+  server.tool('booking_locations', 'List locations/restaurants on a provider.',
+    { provider: _providerEnum.default('jimani') },
+    async ({ provider }) => {
+      try { return { content: jsonContent({ provider, locations: await _buildAdapter(provider).listLocations() }) }; }
+      catch (e) { return { content: jsonContent({ provider, error: e.message }) }; }
+    });
+
+  server.tool('booking_reservation_types', 'List reservation types for a location.',
+    { provider: _providerEnum.default('jimani'), locationId: z.string(), language: z.number().optional() },
+    async ({ provider, locationId, language }) => {
+      try { return { content: jsonContent({ provider, locationId, types: await _buildAdapter(provider).listReservationTypes(locationId, language) }) }; }
+      catch (e) { return { content: jsonContent({ provider, error: e.message }) }; }
+    });
+
+  server.tool('booking_availability', 'Check slots for a type in a date window.',
+    { provider: _providerEnum.default('jimani'), locationId: z.string().optional(), typeId: z.string(),
+      fromDate: z.string(), toDate: z.string().optional(), guestCount: z.number().optional(), language: z.number().optional() },
+    async (args) => {
+      try {
+        const slots = await _buildAdapter(args.provider).checkAvailability(args);
+        return { content: jsonContent({ provider: args.provider, typeId: args.typeId, slots: slots.slice(0, 60), totalSlots: slots.length }) };
+      } catch (e) { return { content: jsonContent({ provider: args.provider, error: e.message }) }; }
+    });
+
+  server.tool('booking_required_fields', 'List required + optional fields for a reservation type.',
+    { provider: _providerEnum.default('jimani'), typeId: z.string(), language: z.number().optional() },
+    async ({ provider, typeId, language }) => {
+      try { return { content: jsonContent({ provider, typeId, fields: await _buildAdapter(provider).listRequiredFields(typeId, language) }) }; }
+      catch (e) { return { content: jsonContent({ provider, error: e.message }) }; }
+    });
+
+  server.tool('booking_products', 'List upsell / deposit products for a type.',
+    { provider: _providerEnum.default('jimani'), typeId: z.string(), language: z.number().optional() },
+    async ({ provider, typeId, language }) => {
+      try { return { content: jsonContent({ provider, typeId, products: await _buildAdapter(provider).listProducts(typeId, language) }) }; }
+      catch (e) { return { content: jsonContent({ provider, error: e.message }) }; }
+    });
+
+  server.tool('booking_create', 'Create a reservation on any supported provider. Unified response incl. paymentUrl if deposit required.',
+    { provider: _providerEnum.default('jimani'), locationId: z.string().optional(), typeId: z.string(),
+      slot: z.object({ date: z.string(), time: z.string(), guestCount: z.number() }),
+      guest: z.object({ firstName: z.string(), lastName: z.string(), email: z.string(), phone: z.string().optional(), salutation: z.string().optional() }),
+      fields: z.array(z.object({ idField: z.number(), value: z.string() })).optional(),
+      baseUrl: z.string().optional().default('https://clonecaller.com/book'),
+      language: z.string().optional().default('en') },
+    async (args) => {
+      try { return { content: jsonContent({ provider: args.provider, reservation: await _buildAdapter(args.provider).createReservation(args) }) }; }
+      catch (e) { return { content: jsonContent({ provider: args.provider, error: e.message }) }; }
+    });
+
+  server.tool('booking_get', 'Fetch a reservation by ID (provider-dependent).',
+    { provider: _providerEnum.default('jimani'), reservationId: z.string() },
+    async ({ provider, reservationId }) => {
+      try { return { content: jsonContent({ provider, reservation: await _buildAdapter(provider).getReservation(reservationId) }) }; }
+      catch (e) { return { content: jsonContent({ provider, error: e.message }) }; }
+    });
+
+  server.tool('booking_cancel', 'Cancel a reservation (provider-dependent).',
+    { provider: _providerEnum.default('jimani'), reservationId: z.string(), reason: z.string().optional() },
+    async ({ provider, reservationId, reason }) => {
+      try { return { content: jsonContent({ provider, result: await _buildAdapter(provider).cancelReservation(reservationId, reason) }) }; }
+      catch (e) { return { content: jsonContent({ provider, error: e.message }) }; }
+    });
+
   return server;
 }
 
