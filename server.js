@@ -32,6 +32,10 @@ const MCP_API_KEY = process.env.MCP_API_KEY || "change-me-in-production";
 const DEFAULT_CLIENT_ID = process.env.JIMANI_CLIENT_ID || "";
 const DEFAULT_PARTNER_ID = process.env.JIMANI_PARTNER_ID || "";
 const DEFAULT_STATIC_KEY = process.env.JIMANI_API_KEY || "";
+// OAuth / Bearer credentials are a DIFFERENT pair from Basic (ClientId:PartnerId).
+// Jimani's /api/Token expects OAuth2 snake_case: client_id + client_secret + grant_type.
+const DEFAULT_OAUTH_CLIENT_ID = process.env.JIMANI_OAUTH_CLIENT_ID || "";
+const DEFAULT_OAUTH_CLIENT_SECRET = process.env.JIMANI_OAUTH_CLIENT_SECRET || "";
 
 // Node 18+ has global fetch, but keep node-fetch as fallback for older runtimes
 let _fetchMod = null;
@@ -53,6 +57,9 @@ let authState = {
   staticKey: DEFAULT_STATIC_KEY || null,
   clientId: DEFAULT_CLIENT_ID || null,
   partnerId: DEFAULT_PARTNER_ID || null,
+  oauthClientId: DEFAULT_OAUTH_CLIENT_ID || null,
+  oauthClientSecret: DEFAULT_OAUTH_CLIENT_SECRET || null,
+  companyId: null,  // extracted from JWT claims after obtaining bearer
 };
 
 function basicHeader() {
@@ -62,13 +69,18 @@ function basicHeader() {
 }
 
 async function obtainBearer() {
-  if (!authState.clientId || !authState.partnerId) {
-    throw new Error("No JIMANI_CLIENT_ID/JIMANI_PARTNER_ID configured. Call the 'authenticate' tool or set env vars.");
+  // OAuth Client Credentials uses SEPARATE credentials from Basic auth.
+  // Basic:     ClientId:PartnerId  (e.g. "basic-client-01":"basic-auth-partner")
+  // OAuth:     ClientId:SecretKey  (e.g. "jwt-client-01":"s3cr3t-k3y-...")
+  const cid = authState.oauthClientId || authState.clientId;
+  const sec = authState.oauthClientSecret;
+  if (!cid || !sec) {
+    throw new Error("No JIMANI_OAUTH_CLIENT_ID / JIMANI_OAUTH_CLIENT_SECRET configured. Call 'authenticate' with mode='bearer' + clientId + clientSecret, or set env vars.");
   }
   const fetch = await getFetch();
   const body = {
-    client_id: authState.clientId,
-    partner_id: authState.partnerId,
+    client_id: cid,
+    client_secret: sec,
     grant_type: "client_credentials",
   };
   const res = await fetch(`${API_BASE}/api/Token`, {
@@ -85,7 +97,15 @@ async function obtainBearer() {
   if (!token) throw new Error(`No token in response: ${JSON.stringify(data).slice(0, 300)}`);
   authState.bearer = token;
   authState.bearerExpiry = Date.now() + (expiresIn - 60) * 1000;
-  return { token, expiresIn, raw: data };
+  // Decode JWT claims to capture CompanyId (needed by CreateReservation body)
+  try {
+    const parts = token.split(".");
+    if (parts.length >= 2) {
+      const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString());
+      if (claims.CompanyId) authState.companyId = Number(claims.CompanyId);
+    }
+  } catch {}
+  return { token, expiresIn, companyId: authState.companyId, raw: data };
 }
 
 async function ensureBearer() {
@@ -128,29 +148,37 @@ function buildMcpServer() {
   const server = new McpServer({ name: "jimani-online", version: "1.0.0" });
 
   // ----- AUTH -----
-  server.tool(
+    server.tool(
     "authenticate",
-    "Configure Jimani authentication. Modes: basic (Authorization: Basic base64(clientId:partnerId)), bearer (OAuth Client Credentials via /api/Token), apikey (X-Api-Key header). Mode is auto-inferred from supplied params if omitted.",
+    "Configure Jimani auth. Three modes: basic (Authorization: Basic base64(ClientId:PartnerId)), bearer (OAuth2 /api/Token with ClientId + ClientSecret — different credentials from Basic), apikey (X-Api-Key). Bearer tokens are JWTs with ~1 hour TTL, cached until 60s before expiry.",
     {
-      mode: z.enum(["basic", "bearer", "apikey"]).optional().describe("Auth mode"),
-      clientId: z.string().optional().describe("Jimani Client ID"),
-      partnerId: z.string().optional().describe("Jimani Partner ID"),
-      apiKey: z.string().optional().describe("Static X-Api-Key value"),
+      mode: z.enum(["basic", "bearer", "apikey"]).optional(),
+      clientId: z.string().optional().describe("Basic ClientId OR OAuth ClientId depending on mode"),
+      partnerId: z.string().optional().describe("Basic auth PartnerId"),
+      clientSecret: z.string().optional().describe("OAuth client secret — used when mode=bearer"),
+      apiKey: z.string().optional().describe("Static X-Api-Key"),
     },
-    async ({ mode, clientId, partnerId, apiKey }) => {
+    async ({ mode, clientId, partnerId, clientSecret, apiKey }) => {
       if (apiKey) authState.staticKey = apiKey;
-      if (clientId) authState.clientId = clientId;
+      if (clientSecret) authState.oauthClientSecret = clientSecret;
+      if (clientId) {
+        // When mode=bearer, store under oauthClientId; otherwise under Basic clientId
+        if (mode === "bearer" || clientSecret) authState.oauthClientId = clientId;
+        else authState.clientId = clientId;
+      }
       if (partnerId) authState.partnerId = partnerId;
 
       let resolved = mode;
       if (!resolved) {
         if (apiKey) resolved = "apikey";
+        else if (clientSecret || (clientId && clientSecret)) resolved = "bearer";
         else if (clientId && partnerId) resolved = "basic";
         else if (authState.staticKey) resolved = "apikey";
+        else if (authState.oauthClientId && authState.oauthClientSecret) resolved = "bearer";
         else if (authState.clientId && authState.partnerId) resolved = "basic";
       }
       if (!resolved) {
-        return { content: [{ type: "text", text: "No credentials supplied. Pass apiKey, or clientId+partnerId, or set env vars." }] };
+        return { content: [{ type: "text", text: "No credentials supplied. Pass apiKey, or clientId+partnerId for basic, or clientId+clientSecret for bearer." }] };
       }
       authState.mode = resolved;
 
@@ -162,15 +190,14 @@ function buildMcpServer() {
       if (resolved === "basic") {
         authState.bearer = null;
         authState.bearerExpiry = 0;
-        return { content: [{ type: "text", text: "Mode: basic. Authorization: Basic <base64(clientId:partnerId)> will be sent on every call." }] };
+        return { content: [{ type: "text", text: "Mode: basic. Authorization: Basic base64(clientId:partnerId)." }] };
       }
       if (resolved === "bearer") {
         const r = await obtainBearer();
-        return { content: [{ type: "text", text: "Mode: bearer. Token acquired, expires in " + r.expiresIn + "s." }] };
+        return { content: [{ type: "text", text: `Mode: bearer. Token acquired, expires in ${r.expiresIn}s. CompanyId from JWT: ${r.companyId || "(not present)"}` }] };
       }
     }
   );
-
   server.tool("auth_status", "Check current auth configuration and token state.", {}, async () => {
     const now = Date.now();
     return {
@@ -181,8 +208,11 @@ function buildMcpServer() {
           mode: authState.mode || "unset",
           hasBearer: Boolean(authState.bearer),
           bearerExpiresInSeconds: authState.bearerExpiry > now ? Math.floor((authState.bearerExpiry - now) / 1000) : 0,
+          companyId: authState.companyId,
           clientIdConfigured: Boolean(authState.clientId),
           partnerIdConfigured: Boolean(authState.partnerId),
+          oauthClientIdConfigured: Boolean(authState.oauthClientId),
+          oauthClientSecretConfigured: Boolean(authState.oauthClientSecret),
           staticKeyConfigured: Boolean(authState.staticKey),
         }, null, 2),
       }],
