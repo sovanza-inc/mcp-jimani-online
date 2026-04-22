@@ -65,7 +65,7 @@ class JimaniAdapter {
   }
 
   async listRequiredFields(typeId, language = 1) {
-    const r = await this._req('GET', `/api/HorecaReservation/GetHorecaReservationFields?reservationTypeId=${encodeURIComponent(typeId)}&idLanguage=${language}`);
+    const r = await this._req('GET', `/api/HorecaReservation/GetHorecaReservationFields?idReservationType=${encodeURIComponent(typeId)}&idLanguage=${language}`);
     if (!r.ok) throw new Error('Jimani listRequiredFields failed');
     const d = r.data?.result || {};
     const merge = (arr, required) => (arr || []).map(f => ({ id: String(f.idField), name: f.name, type: f.type, required, options: f.options || [] }));
@@ -78,20 +78,26 @@ class JimaniAdapter {
     return (r.data?.result || []).map(p => ({ id: String(p.idProduct), name: p.productName, description: p.productInfo, price: p.price1, currency: 'EUR' }));
   }
 
-  async createReservation({ typeId, slot, guest, fields = [], baseUrl = 'https://clonecaller.com/book', language = 'en' }) {
+  async createReservation({ typeId, arrangementId, slot, guest, fields = [], companyId = 100305, baseUrl, language = 'en' }) {
     const body = {
-      key: 'mcp-unified',
-      baseUrl, language, idLanguage: 1,
-      reservationTypeId: Number(typeId),
-      date: slot.date, arrivaltime: slot.time, guestCount: slot.guestCount,
-      guest, fields,
+      idReservationtype: Number(typeId),
+      idArrangementtype: arrangementId ? Number(arrangementId) : 0,
+      totalGuests: slot.guestCount,
+      arrivalDate: slot.date + 'T' + (slot.time || '00:00:00'),
+      arrivalTime: slot.time,
+      idLanguage: 1,
+      idCompany: companyId,
+      widgetId: 0,
+      reservationRequest: false,
+      reservationRequestMin: 0,
+      mainModuleId: 0,
       guestFields: [
-        { idGuestDetails: 1543, value: guest.firstName },
-        { idGuestDetails: 1544, value: guest.lastName },
-        { idGuestDetails: 1545, value: guest.email },
-        ...(guest.phone ? [{ idGuestDetails: 1546, value: guest.phone }] : []),
+        { idfield: '1543', data: guest.firstName },
+        { idfield: '1544', data: guest.lastName },
+        { idfield: '1545', data: guest.email },
+        ...(guest.phone ? [{ idfield: '1546', data: guest.phone }] : []),
       ],
-      CombinationInfo: [],
+      fields,
     };
     const r = await this._req('POST', '/api/HorecaReservation/CreateReservation', body);
     const blob = JSON.stringify(r.data || {});

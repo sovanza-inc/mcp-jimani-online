@@ -231,45 +231,17 @@ function buildMcpServer() {
     }
   );
 
-  server.tool(
-    "company_opening_hours",
-    "GET /api/Company/GetHorecaOpeningHours — Retrieve HORECA opening hours. NOTE: Jimani returns thousands of day records in one call (~280k chars). This tool client-side filters to fromDate..toDate to keep responses usable.",
+    server.tool(
+    "company_opening_hours_for_date",
+    "GET /api/Company/GetHorecaOpeningAndClosingHoursForDate — Retrieve HORECA opening hours for a specific date (v1.2 endpoint, replaces the unfiltered GetHorecaOpeningHours).",
     {
-      fromDate: z.string().optional().describe("ISO date YYYY-MM-DD — defaults to today"),
-      toDate: z.string().optional().describe("ISO date YYYY-MM-DD — defaults to fromDate + 30 days"),
+      date: z.string().describe("ISO date YYYY-MM-DD"),
     },
-    async ({ fromDate, toDate }) => {
-      const r = await apiCall("GET", "/api/Company/GetHorecaOpeningHours");
-      if (!r.ok || !r.data || !Array.isArray(r.data.result)) {
-        return { content: jsonContent(r) };
-      }
-      const from = fromDate ? new Date(fromDate) : new Date();
-      from.setHours(0, 0, 0, 0);
-      const to = toDate ? new Date(toDate) : new Date(from.getTime() + 30 * 86400000);
-      to.setHours(23, 59, 59, 999);
-      const filtered = r.data.result.filter((row) => {
-        if (!row.openingDate) return false;
-        const d = new Date(row.openingDate);
-        return d >= from && d <= to;
-      });
-      return {
-        content: jsonContent({
-          ...r,
-          data: {
-            ...r.data,
-            result: filtered,
-            _meta: {
-              totalRecords: r.data.result.length,
-              returned: filtered.length,
-              window: { from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10) },
-              note: "Filtered client-side. Pass fromDate/toDate to change window.",
-            },
-          },
-        }),
-      };
+    async ({ date }) => {
+      const r = await apiCall("GET", `/api/Company/GetHorecaOpeningAndClosingHoursForDate?date=${encodeURIComponent(date)}`);
+      return { content: jsonContent(r) };
     }
   );
-
   server.tool(
     "company_update_opening_hours",
     "PUT /api/Company/UpdateHorecaOpeningHours — Update opening hours. Pass JSON body (HorecaOpeningHoursModel).",
@@ -301,7 +273,7 @@ function buildMcpServer() {
       toDate: z.string().optional().describe("ISO date YYYY-MM-DD — defaults to fromDate + 14 days"),
     },
     async ({ reservationTypeId, idLanguage, fromDate, toDate }) => {
-      const r = await apiCall("GET", `/api/HorecaReservation/GetHorecaReservationAvailability?reservationTypeId=${encodeURIComponent(reservationTypeId)}&IdLanguage=${idLanguage}`);
+      const r = await apiCall("GET", `/api/HorecaReservation/GetHorecaReservationAvailability?idReservationType=${encodeURIComponent(reservationTypeId)}&idLanguage=${idLanguage}`);
       if (!r.ok || !r.data || !Array.isArray(r.data.result)) {
         return { content: jsonContent(r) };
       }
@@ -345,7 +317,7 @@ function buildMcpServer() {
       idLanguage: z.number().optional().default(1).describe("Language ID (1=English, required by Jimani)"),
     },
     async ({ reservationTypeId, idLanguage }) => {
-      const r = await apiCall("GET", `/api/HorecaReservation/GetHorecaReservationFields?reservationTypeId=${encodeURIComponent(reservationTypeId)}&IdLanguage=${idLanguage}`);
+      const r = await apiCall("GET", `/api/HorecaReservation/GetHorecaReservationFields?idReservationType=${encodeURIComponent(reservationTypeId)}&idLanguage=${idLanguage}`);
       return { content: jsonContent(r) };
     }
   );
@@ -358,87 +330,69 @@ function buildMcpServer() {
       idLanguage: z.number().optional().default(1).describe("Language ID (1=English, required by Jimani)"),
     },
     async ({ reservationTypeId, idLanguage }) => {
-      const r = await apiCall("GET", `/api/HorecaReservation/GetHorecaReservationProducts?reservationTypeId=${encodeURIComponent(reservationTypeId)}&IdLanguage=${idLanguage}`);
+      const r = await apiCall("GET", `/api/HorecaReservation/GetHorecaReservationProducts?idReservationType=${encodeURIComponent(reservationTypeId)}&idLanguage=${idLanguage}`);
       return { content: jsonContent(r) };
     }
   );
 
   server.tool(
-    "reservation_guest_details",
-    "GET /api/HorecaReservation/GetHorecaReservationGuestDetails — Returns the SCHEMA of guest detail fields (salutation, firstname, lastname, email, phone) required on CreateReservation. Despite the name, does NOT look up an existing guest.",
+    "reservation_guest_fields",
+    "GET /api/HorecaReservation/GetHorecaReservationGuestFields — Returns guest input field schema (salutation, firstname, etc). v1.2: renamed from GetHorecaReservationGuestDetails.",
     {
       email: z.string().optional().describe("Guest email (ignored by Jimani in current impl)"),
       idLanguage: z.number().optional().default(1).describe("Language ID (1=English, required by Jimani)"),
     },
     async ({ email, idLanguage }) => {
       const qs = `IdLanguage=${idLanguage}` + (email ? `&email=${encodeURIComponent(email)}` : "");
-      const r = await apiCall("GET", `/api/HorecaReservation/GetHorecaReservationGuestDetails?${qs}`);
+      const r = await apiCall("GET", `/api/HorecaReservation/GetHorecaReservationGuestFields?${qs}`);
       return { content: jsonContent(r) };
     }
   );
 
-  server.tool(
+    server.tool(
     "reservation_create",
-    "POST /api/HorecaReservation/CreateReservation — Create a new reservation. The 7 required fields (key, fields, baseUrl, language, arrivaltime, guestFields, CombinationInfo) are undocumented in Swagger — this tool supplies sensible defaults. Pass a raw body override if you know the exact shape Jimani expects.",
+    "POST /api/HorecaReservation/CreateReservation — Create a reservation using the v1.2 CreateReservationForOpenAICommand schema. Cleanly typed, replaces the v1.0 body with key/baseUrl/CombinationInfo cruft.",
     {
-      reservationTypeId: z.number().describe("Reservation type ID (from reservation_types)"),
-      date: z.string().describe("Reservation date YYYY-MM-DD"),
-      arrivaltime: z.string().describe("Arrival time HH:mm:ss (e.g. 19:00:00)"),
-      guestCount: z.number().describe("Number of guests"),
-      guest: z.object({
-        firstName: z.string(),
-        lastName: z.string(),
-        email: z.string(),
-        phone: z.string().optional(),
-        salutation: z.string().optional(),
-      }).describe("Primary guest contact"),
-      fields: z.array(z.object({
-        idField: z.number(),
-        value: z.string(),
-      })).optional().describe("Custom field answers (from reservation_fields). Default []"),
+      idReservationtype: z.number().describe("Reservation type ID"),
+      idArrangementtype: z.number().optional().describe("Arrangement type ID (Diner=1641 / Lunch=... — from reservation_availability.result[].idArrangementType)"),
+      totalGuests: z.number().describe("Number of guests"),
+      arrivalDate: z.string().describe("ISO date-time (e.g. 2026-05-15T19:00:00)"),
+      arrivalTime: z.string().describe("HH:mm:ss (e.g. 19:00:00)"),
+      idLanguage: z.number().optional().default(1).describe("Language ID (1 = English)"),
+      idCompany: z.number().describe("Company ID — from company_get_info.result.idCompany (e.g. 100305)"),
+      widgetId: z.number().optional().default(0).describe("Widget ID — 0 for API/MCP integrations"),
+      reservationRequest: z.boolean().optional().default(false),
+      reservationRequestMin: z.number().optional().default(0),
+      mainModuleId: z.number().optional().default(0),
       guestFields: z.array(z.object({
-        idGuestDetails: z.number(),
-        value: z.string(),
-      })).optional().describe("Guest field values (from reservation_guest_details schema). Default derived from guest object"),
-      language: z.string().optional().default("en").describe("Language code (en/nl/de/fr)"),
-      baseUrl: z.string().optional().default("https://jimaniai.sovanza.net").describe("Widget base URL for return redirects"),
-      key: z.string().optional().default("mcp-client").describe("Widget key / client identifier"),
-      combinationInfo: z.object({}).passthrough().optional().describe("Combination upsell info object. Default {}"),
-      rawBody: z.string().optional().describe("Pass a complete JSON body to bypass field assembly (advanced)"),
+        idfield: z.string().describe("Guest field ID as string (from reservation_guest_fields)"),
+        data: z.string().describe("Field value"),
+      })).describe("Guest info (salutation, firstname, lastname, email, phone)"),
+      fields: z.array(z.object({
+        idfield: z.number().describe("Custom field ID (from reservation_fields)"),
+        data: z.any().describe("Field value — string, number, or null depending on type"),
+      })).optional().default([]).describe("Custom field answers for this reservation type"),
     },
     async (args) => {
-      if (args.rawBody) {
-        const r = await apiCall("POST", "/api/HorecaReservation/CreateReservation", JSON.parse(args.rawBody));
-        return { content: jsonContent(r) };
-      }
-      // Auto-build guestFields from guest object if not supplied
-      // Default tags observed in guest_details schema: salutation, firstname, lastname, email, phone
-      const guestFields = args.guestFields || [
-        args.guest.salutation ? { idGuestDetails: 1542, value: args.guest.salutation } : null,
-        { idGuestDetails: 1543, value: args.guest.firstName },
-        { idGuestDetails: 1544, value: args.guest.lastName },
-        { idGuestDetails: 1545, value: args.guest.email },
-        args.guest.phone ? { idGuestDetails: 1546, value: args.guest.phone } : null,
-      ].filter(Boolean);
-
       const body = {
-        key: args.key,
-        baseUrl: args.baseUrl,
-        language: args.language,
-        reservationTypeId: args.reservationTypeId,
-        date: args.date,
-        arrivaltime: args.arrivaltime,
-        guestCount: args.guestCount,
-        guest: args.guest,
-        fields: args.fields || [],
-        guestFields,
-        CombinationInfo: args.combinationInfo || {},
+        idReservationtype: args.idReservationtype,
+        idArrangementtype: args.idArrangementtype ?? 0,
+        totalGuests: args.totalGuests,
+        arrivalDate: args.arrivalDate,
+        arrivalTime: args.arrivalTime,
+        idLanguage: args.idLanguage ?? 1,
+        idCompany: args.idCompany,
+        widgetId: args.widgetId ?? 0,
+        reservationRequest: args.reservationRequest ?? false,
+        reservationRequestMin: args.reservationRequestMin ?? 0,
+        mainModuleId: args.mainModuleId ?? 0,
+        guestFields: args.guestFields,
+        fields: args.fields ?? [],
       };
       const r = await apiCall("POST", "/api/HorecaReservation/CreateReservation", body);
       return { content: jsonContent({ request: body, response: r }) };
     }
   );
-
   // Workflow macro: discover → validate → create in one shot
   server.tool(
     "book_reservation",
@@ -526,38 +480,17 @@ function buildMcpServer() {
 
 
   // ── ACTIVITY (Attraction) opening hours — added in API v1.1 ──
-  server.tool(
-    "company_activity_opening_hours",
-    "GET /api/Company/GetActivityOpeningHours — Retrieve activity/attraction opening hours (separate from Horeca hours).",
+    server.tool(
+    "company_activity_opening_hours_for_date",
+    "GET /api/Company/GetActivityOpeningAndClosingHoursForDate — Retrieve activity/attraction opening hours for a specific date (v1.2, date-filtered).",
     {
-      fromDate: z.string().optional().describe("ISO date YYYY-MM-DD — defaults to today"),
-      toDate: z.string().optional().describe("ISO date YYYY-MM-DD — defaults to fromDate + 30 days"),
+      date: z.string().describe("ISO date YYYY-MM-DD"),
     },
-    async ({ fromDate, toDate }) => {
-      const r = await apiCall("GET", "/api/Company/GetActivityOpeningHours");
-      if (!r.ok || !r.data || !Array.isArray(r.data.result)) {
-        return { content: jsonContent(r) };
-      }
-      const from = fromDate ? new Date(fromDate) : new Date();
-      from.setHours(0, 0, 0, 0);
-      const to = toDate ? new Date(toDate) : new Date(from.getTime() + 30 * 86400000);
-      to.setHours(23, 59, 59, 999);
-      const filtered = r.data.result.filter((row) => {
-        if (!row.openingDate) return false;
-        const d = new Date(row.openingDate);
-        return d >= from && d <= to;
-      });
-      return {
-        content: jsonContent({
-          ...r,
-          data: { ...r.data, result: filtered,
-            _meta: { totalRecords: r.data.result.length, returned: filtered.length,
-              window: { from: from.toISOString().slice(0,10), to: to.toISOString().slice(0,10) } } },
-        }),
-      };
+    async ({ date }) => {
+      const r = await apiCall("GET", `/api/Company/GetActivityOpeningAndClosingHoursForDate?date=${encodeURIComponent(date)}`);
+      return { content: jsonContent(r) };
     }
   );
-
   server.tool(
     "company_update_activity_opening_hours",
     "PUT /api/Company/UpdateActivityOpeningHours — Update activity/attraction opening hours.",
